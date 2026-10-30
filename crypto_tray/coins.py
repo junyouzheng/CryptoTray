@@ -41,3 +41,4 @@ CATALOG: dict[str, Coin] = {
 }
 
 CATALOG_ORDER: list[str] = list(CATALOG)
+BY_SYMBOL: dict[str, Coin] = {coin.symbol: coin for coin in CATALOG.values()}

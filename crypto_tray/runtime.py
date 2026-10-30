@@ -22,6 +22,8 @@ from crypto_tray.fetch import (
     load_cache,
     load_fear_greed,
     load_global,
+    load_sparklines,
+    refresh_board,
     merge_cached,
     save_cache,
     search_market,
@@ -234,7 +236,7 @@ class TrayApp:
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _show_quotes(self, quotes, generation: int, empty_text: str = "没有匹配的币种", status: str = "行情实时更新") -> None:
+    def _show_quotes(self, quotes, generation: int, empty_text: str = "没有匹配的币种", status: str = "合约行情实时更新") -> None:
         if generation != self._search_gen or self._closing:
             return
         self._view += 1
@@ -270,7 +272,7 @@ class TrayApp:
         if not ok and not headlines:
             self.dashboard.news_state.configure(text="快讯暂时不可用")
         if self.previous is None:
-            self.previous = Snapshot(headlines=headlines, currency="usd", updated_at=datetime.now().astimezone())
+            self.previous = Snapshot(headlines=headlines, currency="usdt", updated_at=datetime.now().astimezone())
         else:
             self.previous.headlines = headlines
 
@@ -281,20 +283,39 @@ class TrayApp:
         def work() -> None:
             cap, change = load_global("usd")
             fear, fear_text = load_fear_greed()
-            self.root.after(0, lambda: self._apply_overview(cap, change, fear, fear_text))
+            try:
+                sparks = load_sparklines(list(self.base_quotes))
+            except Exception:
+                log.exception("合约走势失败")
+                sparks = {}
+            self.root.after(
+                0,
+                lambda cap=cap, change=change, fear=fear, fear_text=fear_text, sparks=sparks: self._apply_overview(
+                    cap, change, fear, fear_text, sparks
+                ),
+            )
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _apply_overview(self, cap, change, fear, fear_text) -> None:
-        if self._closing or self.previous is None:
+    def _apply_overview(self, cap, change, fear, fear_text, sparks: dict | None = None) -> None:
+        if self._closing:
             return
-        if cap is not None:
-            self.previous.market_cap = cap
-            self.previous.market_change_24h = change
-        if fear is not None:
-            self.previous.fear_greed = fear
-            self.previous.fear_text = fear_text
-        self.dashboard._paint_summary(self.previous)
+        if self.previous is not None:
+            if cap is not None:
+                self.previous.market_cap = cap
+                self.previous.market_change_24h = change
+            if fear is not None:
+                self.previous.fear_greed = fear
+                self.previous.fear_text = fear_text
+            self.dashboard._paint_summary(self.previous)
+        if not sparks:
+            return
+        for quote in self.base_quotes:
+            line = sparks.get(quote.pair)
+            if line:
+                quote.sparkline = line
+        if not self.search_text:
+            self.dashboard.update_prices(self.base_quotes)
 
     def initial_load(self) -> None:
         if self._closing or not self._lock.acquire(blocking=False):
@@ -306,7 +327,7 @@ class TrayApp:
                 snapshot = fetch_snapshot(self.config)
             except Exception:
                 log.exception("首次加载失败")
-                snapshot = Snapshot(status="行情暂时不可用", currency="usd")
+                snapshot = Snapshot(status="行情暂时不可用", currency="usdt")
             finally:
                 self._lock.release()
             self.root.after(0, lambda snap=snapshot: self._apply_initial(snap))
@@ -345,13 +366,18 @@ class TrayApp:
         view = self._view
         current = self.shown
 
+        searching = bool(self.search_text)
+
         def work() -> None:
             try:
-                fresh = live_prices(current)[1]
+                if searching:
+                    quotes, fresh = live_prices(current)
+                else:
+                    quotes, fresh = refresh_board(list(self.base_quotes))
             except Exception:
                 log.exception("实时行情失败")
-                fresh = False
-            self.root.after(0, lambda: self._apply_live(current, view, fresh))
+                quotes, fresh = current, False
+            self.root.after(0, lambda quotes=quotes, fresh=fresh: self._apply_live(quotes, view, fresh))
 
         threading.Thread(target=work, daemon=True).start()
         self._arm_prices()
@@ -363,8 +389,12 @@ class TrayApp:
         self.shown = quotes
         if not self.search_text:
             self.base_quotes = quotes
-        self.dashboard.update_prices(quotes)
-        self.dashboard.set_status("行情实时更新", UP)
+        ids = [item.coin_id for item in quotes]
+        if ids != self.dashboard.row_ids:
+            self.dashboard.set_quotes(quotes, scroll=False)
+        else:
+            self.dashboard.update_prices(quotes)
+        self.dashboard.set_status("合约行情实时更新", UP)
         self._update_tray(quotes)
         if self.previous is not None:
             self.previous.quotes = self.base_quotes
@@ -392,7 +422,7 @@ class TrayApp:
             if quote.price is None:
                 continue
             change = "" if quote.change_24h is None else f" {quote.change_24h:+.1f}%"
-            parts.append(f"{quote.symbol} {format_price(quote.price, 'usd')}{change}")
+            parts.append(f"{quote.symbol} {format_price(quote.price, quote.currency)}{change}")
         title = (" · ".join(parts) or "币讯")[:127]
         if title != self.icon.title:
             self.icon.title = title

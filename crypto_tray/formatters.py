@@ -5,10 +5,18 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 
+def _unit(currency: str) -> tuple[str, str]:
+    if currency == "cny":
+        return "¥", ""
+    if currency == "usdt":
+        return "", " USDT"
+    return "$", ""
+
+
 def format_price(value: float | None, currency: str) -> str:
     if value is None:
         return "--"
-    symbol = "¥" if currency == "cny" else "$"
+    prefix, suffix = _unit(currency)
     magnitude = abs(value)
     if magnitude >= 1:
         body = f"{value:,.2f}"
@@ -18,7 +26,7 @@ def format_price(value: float | None, currency: str) -> str:
         body = f"{value:,.6f}"
     else:
         body = f"{value:.8f}"
-    return symbol + body
+    return prefix + body + suffix
 
 
 def format_change(value: float | None) -> str:
@@ -30,7 +38,7 @@ def format_change(value: float | None) -> str:
 def format_compact(value: float | None, currency: str) -> str:
     if value is None:
         return "--"
-    symbol = "¥" if currency == "cny" else "$"
+    prefix, suffix = _unit(currency)
     magnitude = abs(value)
     if magnitude >= 1e12:
         body = f"{value / 1e12:.2f}万亿"
@@ -42,7 +50,7 @@ def format_compact(value: float | None, currency: str) -> str:
         body = f"{value / 1e4:.2f}万"
     else:
         body = f"{value:,.0f}"
-    return symbol + body
+    return prefix + body + suffix
 
 
 def relative_time(moment: datetime | None, now: datetime | None = None) -> str:

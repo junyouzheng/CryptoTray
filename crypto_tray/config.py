@@ -82,7 +82,7 @@ def autostart_enabled() -> bool:
 
 @dataclass
 class Config:
-    currency: str = "usd"
+    currency: str = "usdt"
     autostart: bool = True
     coins: list[str] = field(default_factory=lambda: list(DEFAULT_COINS))
     path: Path = field(default_factory=lambda: data_dir() / "config.json")
@@ -122,7 +122,7 @@ def load_config() -> Config:
     coins = coins[:MAX_COINS]
 
     cfg = Config(
-        currency="usd",
+        currency="usdt",
         autostart=bool(raw.get("autostart", True)),
         coins=coins,
         path=path,

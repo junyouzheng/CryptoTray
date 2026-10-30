@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
 
-from crypto_tray.coins import CATALOG
+from crypto_tray.coins import BY_SYMBOL
 from crypto_tray.config import Config, data_dir
 
 log = logging.getLogger("crypto_tray.fetch")
@@ -25,7 +25,8 @@ UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 CryptoTray/1.0"
 )
-CACHE_VERSION = 1
+CACHE_VERSION = 2
+MARKET_COUNT = 10
 
 FNG_ZH = {
     "Extreme Fear": "极度恐惧",
@@ -56,15 +57,6 @@ class FetchError(Exception):
     pass
 
 
-def _identity(coin_id: str, row: dict | None = None) -> tuple[str, str, str]:
-    known = CATALOG.get(coin_id)
-    if known is not None:
-        return known.symbol, known.name, known.binance
-    symbol = str((row or {}).get("symbol") or coin_id)[:12].upper()
-    name = str((row or {}).get("name") or symbol)
-    return symbol, name, f"{symbol}USDT"
-
-
 @dataclass
 class Quote:
     coin_id: str
@@ -77,11 +69,6 @@ class Quote:
     sparkline: list[float]
     currency: str
     pair: str = ""
-
-    @classmethod
-    def empty(cls, coin_id: str, currency: str) -> Quote:
-        symbol, name, pair = _identity(coin_id)
-        return cls(coin_id, symbol, name, None, None, None, None, [], currency, pair)
 
 
 @dataclass
@@ -162,66 +149,152 @@ def _utc(moment: datetime | None) -> datetime | None:
     return moment.astimezone(timezone.utc)
 
 
-def quotes_from_gecko(rows: object, coin_ids: list[str], currency: str) -> list[Quote]:
-    by_id: dict[str, dict] = {}
-    if isinstance(rows, list):
-        for row in rows:
-            if isinstance(row, dict) and isinstance(row.get("id"), str):
-                by_id[row["id"]] = row
-    quotes: list[Quote] = []
-    for coin_id in coin_ids:
-        row = by_id.get(coin_id)
-        if row is None:
-            quotes.append(Quote.empty(coin_id, currency))
+def _swap_base(inst: str) -> str:
+    suffix = "-USDT-SWAP"
+    if not inst.endswith(suffix):
+        return ""
+    base = inst[: -len(suffix)]
+    if base.isalnum():
+        return base
+    return ""
+
+
+def _quote_volume_usdt(row: dict) -> float | None:
+    """OKX 永续的 volCcy24h 是基础币数量，乘最新价得到 USDT 成交额。"""
+    last = _num(row.get("last"))
+    base_volume = _num(row.get("volCcy24h"))
+    if last is None or last <= 0 or base_volume is None or base_volume < 0:
+        return None
+    return base_volume * last
+
+
+def _change_24h(row: dict, last: float) -> float | None:
+    open_price = _num(row.get("open24h"))
+    if open_price is None or open_price <= 0:
+        return None
+    return (last - open_price) / open_price * 100
+
+
+def quote_from_swap(row: dict, volume: float, sparkline: list[float] | None = None) -> Quote | None:
+    inst = str(row.get("instId") or "")
+    base = _swap_base(inst)
+    last = _num(row.get("last"))
+    if not base or last is None:
+        return None
+    known = BY_SYMBOL.get(base)
+    return Quote(
+        coin_id=inst.lower(),
+        symbol=base,
+        name=known.name if known is not None else base,
+        price=last,
+        change_24h=_change_24h(row, last),
+        change_1h=None,
+        volume=volume,
+        sparkline=list(sparkline or []),
+        currency="usdt",
+        pair=inst,
+    )
+
+
+def ranked_swaps(rows: object) -> list[tuple[dict, float]]:
+    ranked: list[tuple[dict, float]] = []
+    if not isinstance(rows, list):
+        return ranked
+    for row in rows:
+        if not isinstance(row, dict) or not _swap_base(str(row.get("instId") or "")):
             continue
-        spark_raw = (row.get("sparkline_in_7d") or {}).get("price") or []
-        spark = [_num(item) for item in spark_raw]
-        spark = [item for item in spark if item is not None]
-        change_1h = _num(row.get("price_change_percentage_1h_in_currency"))
-        if change_1h is None:
-            change_1h = _num(row.get("price_change_percentage_1h"))
-        symbol, name, pair = _identity(coin_id, row)
-        quotes.append(
-            Quote(
-                coin_id=coin_id,
-                symbol=symbol,
-                name=name,
-                price=_num(row.get("current_price")),
-                change_24h=_num(row.get("price_change_percentage_24h")),
-                change_1h=change_1h,
-                volume=_num(row.get("total_volume")),
-                sparkline=downsample(spark),
-                currency=currency,
-                pair=pair,
-            )
-        )
+        volume = _quote_volume_usdt(row)
+        if volume is None:
+            continue
+        ranked.append((row, volume))
+    ranked.sort(key=lambda item: item[1], reverse=True)
+    return ranked
+
+
+def board_from_rows(rows: object, sparks: dict[str, list[float]] | None = None, limit: int = MARKET_COUNT) -> list[Quote]:
+    sparks = sparks or {}
+    quotes: list[Quote] = []
+    for row, volume in ranked_swaps(rows)[:limit]:
+        inst = str(row.get("instId") or "")
+        quote = quote_from_swap(row, volume, sparks.get(inst))
+        if quote is not None and quote.price is not None:
+            quotes.append(quote)
     return quotes
 
 
-def load_quotes(config: Config) -> tuple[list[Quote], str, str, bool, str]:
-    query = urllib.parse.urlencode(
-        {
-            "vs_currency": config.currency,
-            "ids": ",".join(config.coins),
-            "sparkline": "true",
-            "price_change_percentage": "1h,24h",
-            "precision": "full",
-        }
-    )
+_swap_backoff_until = 0.0
+_swap_warned = False
+
+
+def fetch_swap_rows() -> list[dict]:
+    global _swap_backoff_until, _swap_warned
+    now = time.monotonic()
+    if now < _swap_backoff_until:
+        raise FetchError("合约行情冷却中")
     try:
-        rows = http_json(f"https://api.coingecko.com/api/v3/coins/markets?{query}", timeout=20)
-        quotes = quotes_from_gecko(rows, config.coins, config.currency)
-        live = any(item.price is not None for item in quotes)
-        if not live:
-            raise FetchError("行情结果是空的")
-        return quotes, "CoinGecko", "usd", True, ""
+        payload = http_json("https://www.okx.com/api/v5/market/tickers?instType=SWAP", timeout=12)
     except FetchError as exc:
-        log.warning("CoinGecko 失败：%s", exc)
-    quotes = [Quote.empty(coin_id, "usd") for coin_id in config.coins]
-    updated, fresh = live_prices(quotes)
-    if fresh:
-        return updated, "OKX", "usd", True, ""
-    return quotes, "", "usd", False, "行情暂时不可用"
+        _swap_backoff_until = time.monotonic() + 30
+        if not _swap_warned:
+            log.warning("合约行情失败：%s", exc)
+            _swap_warned = True
+        raise
+    rows = payload.get("data") if isinstance(payload, dict) else None
+    ranked = ranked_swaps(rows)
+    if not ranked:
+        _swap_backoff_until = time.monotonic() + 30
+        raise FetchError("合约行情结果是空的")
+    _swap_warned = False
+    return [row for row, _volume in ranked]
+
+
+def _candle_closes(inst: str) -> list[float]:
+    query = urllib.parse.urlencode({"instId": inst, "bar": "4H", "limit": "42"})
+    try:
+        payload = http_json("https://www.okx.com/api/v5/market/candles?" + query, timeout=8)
+    except FetchError:
+        return []
+    rows = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return []
+    closes: list[float] = []
+    for row in reversed(rows):
+        if isinstance(row, list) and len(row) >= 5:
+            price = _num(row[4])
+            if price is not None:
+                closes.append(price)
+    return downsample(closes)
+
+
+def load_sparklines(quotes: list[Quote]) -> dict[str, list[float]]:
+    inst_ids = [item.pair for item in quotes if item.pair]
+    if not inst_ids:
+        return {}
+    found: dict[str, list[float]] = {}
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = {pool.submit(_candle_closes, inst): inst for inst in inst_ids}
+        for future in as_completed(futures):
+            found[futures[future]] = future.result()
+    return found
+
+
+def _with_sparklines(quotes: list[Quote]) -> list[Quote]:
+    sparks = load_sparklines(quotes)
+    for item in quotes:
+        item.sparkline = sparks.get(item.pair, [])
+    return quotes
+
+
+def load_quotes(_config: Config) -> tuple[list[Quote], str, str, bool, str]:
+    """按 OKX USDT 永续合约 24 小时成交额取前 10。价格是合约最新价。"""
+    try:
+        quotes = _with_sparklines(board_from_rows(fetch_swap_rows()))
+    except FetchError as exc:
+        log.warning("合约榜失败：%s", exc)
+        return [], "", "usdt", False, "行情暂时不可用"
+    if not quotes:
+        return [], "", "usdt", False, "行情暂时不可用"
+    return quotes, "OKX", "usdt", True, ""
 
 
 def load_global(currency: str) -> tuple[float | None, float | None]:
@@ -316,116 +389,72 @@ def fetch_news() -> tuple[list[Headline], bool]:
 
 
 def search_market(query: str) -> list[Quote]:
-    text = query.strip()
+    text = query.strip().casefold()
     if not text:
         return []
-    payload = http_json(
-        "https://api.coingecko.com/api/v3/search?query=" + urllib.parse.quote(text),
-        timeout=12,
-    )
-    coins = payload.get("coins") if isinstance(payload, dict) else None
-    ids: list[str] = []
-    if isinstance(coins, list):
-        for coin in coins:
-            if not isinstance(coin, dict):
-                continue
-            coin_id = coin.get("id")
-            if isinstance(coin_id, str) and re.fullmatch(r"[a-z0-9-]+", coin_id) and coin_id not in ids:
-                ids.append(coin_id)
-            if len(ids) >= 8:
-                break
-    if not ids:
-        return []
-    query_string = urllib.parse.urlencode(
-        {
-            "vs_currency": "usd",
-            "ids": ",".join(ids),
-            "sparkline": "true",
-            "price_change_percentage": "1h,24h",
-            "precision": "full",
-        }
-    )
-    rows = http_json(f"https://api.coingecko.com/api/v3/coins/markets?{query_string}", timeout=15)
-    return [item for item in quotes_from_gecko(rows, ids, "usd") if item.price is not None]
+    exact: list[Quote] = []
+    partial: list[Quote] = []
+    for row, volume in ranked_swaps(fetch_swap_rows()):
+        inst = str(row.get("instId") or "")
+        base = _swap_base(inst)
+        known = BY_SYMBOL.get(base)
+        fields = [base.casefold()]
+        if known is not None:
+            fields.extend((known.symbol.casefold(), known.name.casefold(), known.coin_id.casefold()))
+        quote = quote_from_swap(row, volume)
+        if quote is None:
+            continue
+        if base.casefold() == text or (known is not None and known.name.casefold() == text):
+            exact.append(quote)
+        elif any(text in field for field in fields):
+            partial.append(quote)
+    matched = (exact + partial)[:MARKET_COUNT]
+    return _with_sparklines(matched) if matched else []
 
 
-_live_backoff_until = 0.0
-_live_warned = False
+def _swap_index() -> dict[str, tuple[dict, float]]:
+    return {str(row.get("instId") or ""): (row, volume) for row, volume in ranked_swaps(fetch_swap_rows())}
 
 
-def _okx_inst(pair: str) -> str:
-    symbol = pair.upper()
-    if symbol.endswith("USDT") and symbol[:-4].isalnum():
-        return symbol[:-4] + "-USDT"
-    return ""
-
-
-_okx_pool: ThreadPoolExecutor | None = None
-
-
-def _okx_workers() -> ThreadPoolExecutor:
-    global _okx_pool
-    if _okx_pool is None:
-        _okx_pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="okx")
-    return _okx_pool
-
-
-def _okx_ticker(inst: str) -> dict | None:
+def refresh_board(existing: list[Quote]) -> tuple[list[Quote], bool]:
+    """重新取成交额前 10，并沿用已有走势。"""
     try:
-        payload = http_json("https://www.okx.com/api/v5/market/ticker?instId=" + urllib.parse.quote(inst), timeout=6)
+        sparks = {item.pair: item.sparkline for item in existing}
+        quotes = board_from_rows(fetch_swap_rows(), sparks)
     except FetchError:
-        return None
-    rows = payload.get("data") if isinstance(payload, dict) else None
-    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
-        return rows[0]
-    return None
+        return existing, False
+    if not quotes:
+        return existing, False
+    return quotes, True
 
 
 def live_prices(quotes: list[Quote]) -> tuple[list[Quote], bool]:
-    """用 OKX 的美元成交价原地刷新。线程池只创建一次。"""
-    global _live_backoff_until, _live_warned
-    now = time.monotonic()
-    if now < _live_backoff_until:
+    """用同一批 USDT 永续行情刷新指定合约，不改动名单顺序。"""
+    try:
+        by_inst = _swap_index()
+    except FetchError:
         return quotes, False
-    inst_by_pair = {item.pair: _okx_inst(item.pair) for item in quotes if _okx_inst(item.pair)}
-    if not inst_by_pair:
-        return quotes, False
-    by_inst: dict[str, dict] = {}
-    pool = _okx_workers()
-    futures = {pool.submit(_okx_ticker, inst): inst for inst in set(inst_by_pair.values())}
-    for future in as_completed(futures):
-        row = future.result()
-        if row is not None:
-            by_inst[futures[future]] = row
     fresh = False
     for item in quotes:
-        row = by_inst.get(inst_by_pair.get(item.pair, ""))
-        price = _num(row.get("last")) if row else None
-        open_price = _num(row.get("open24h")) if row else None
-        volume = _num(row.get("volCcy24h")) if row else None
-        if price is None:
+        found = by_inst.get(item.pair)
+        if found is None:
             continue
+        row, volume = found
+        last = _num(row.get("last"))
+        if last is None:
+            continue
+        item.price = last
+        item.change_24h = _change_24h(row, last)
+        item.volume = volume
+        item.currency = "usdt"
         fresh = True
-        if open_price is not None and open_price > 0:
-            item.change_24h = (price - open_price) / open_price * 100
-        item.price = price
-        if volume is not None:
-            item.volume = volume
-        item.currency = "usd"
-    if fresh:
-        _live_warned = False
-    else:
-        _live_backoff_until = now + 30
-        if not _live_warned:
-            log.warning("实时行情失败：OKX 没有返回价格")
-            _live_warned = True
     return quotes, fresh
 
 
 def fetch_snapshot(config: Config) -> Snapshot:
     with ThreadPoolExecutor(max_workers=4) as pool:
         quotes_future = pool.submit(load_quotes, config)
-        global_future = pool.submit(load_global, config.currency)
+        global_future = pool.submit(load_global, "usd")
         fear_future = pool.submit(load_fear_greed)
         news_future = pool.submit(fetch_news)
         quotes, source, currency, live, note = quotes_future.result()
@@ -433,8 +462,6 @@ def fetch_snapshot(config: Config) -> Snapshot:
         fear_value, fear_text = fear_future.result()
         headlines, news_ok = news_future.result()
 
-    if currency != config.currency:
-        market_cap = None
     status = note
     if not live:
         status = "行情暂时不可用"
@@ -505,6 +532,20 @@ def snapshot_to_dict(snapshot: Snapshot) -> dict:
     return payload
 
 
+def _cached_swap(item: object) -> bool:
+    if not isinstance(item, dict):
+        return False
+    coin_id = item.get("coin_id")
+    pair = str(item.get("pair") or "")
+    symbol = str(item.get("symbol") or "")
+    return (
+        isinstance(coin_id, str)
+        and re.fullmatch(r"[a-z0-9-]{1,48}", coin_id) is not None
+        and pair.endswith("-USDT-SWAP")
+        and symbol.isalnum()
+    )
+
+
 def snapshot_from_dict(payload: dict) -> Snapshot | None:
     if payload.get("version") != CACHE_VERSION or not isinstance(payload.get("snapshot"), dict):
         return None
@@ -520,11 +561,11 @@ def snapshot_from_dict(payload: dict) -> Snapshot | None:
                 change_1h=_num(item.get("change_1h")),
                 volume=_num(item.get("volume")),
                 sparkline=[n for n in (_num(v) for v in item.get("sparkline") or []) if n is not None],
-                currency="usd",
+                currency="usdt",
                 pair=str(item.get("pair") or ""),
             )
             for item in raw.get("quotes") or []
-            if isinstance(item, dict) and item.get("coin_id") in CATALOG
+            if _cached_swap(item)
         ]
         headlines = [
             Headline(
@@ -546,7 +587,7 @@ def snapshot_from_dict(payload: dict) -> Snapshot | None:
         fear_text=str(raw.get("fear_text") or ""),
         market_cap=_num(raw.get("market_cap")),
         market_change_24h=_num(raw.get("market_change_24h")),
-        currency=raw.get("currency") if raw.get("currency") in ("cny", "usd") else "usd",
+        currency="usdt",
         updated_at=updated,
         price_source=str(raw.get("price_source") or ""),
         live=False,
@@ -600,10 +641,23 @@ def run_check() -> int:
     from crypto_tray.formatters import format_change, format_compact, format_price, relative_time
 
     assert format_price(1000, "usd") == "$1,000.00"
+    assert format_price(1000, "usdt") == "1,000.00 USDT"
     assert format_price(None, "cny") == "--"
     assert format_change(1.2) == "+1.20%"
     assert format_change(-4.489) == "-4.49%"
     assert format_compact(1.32e13, "cny") == "¥13.20万亿"
+    assert format_compact(1.33e10, "usdt") == "133亿 USDT"
+    sample_rows = [
+        {"instId": "AAA-USDT-SWAP", "last": "2", "volCcy24h": "10", "open24h": "1"},
+        {"instId": "BBB-USDT-SWAP", "last": "3", "volCcy24h": "10", "open24h": "3"},
+        {"instId": "BTC-USD-SWAP", "last": "100", "volCcy24h": "999", "open24h": "100"},
+    ]
+    ranked = board_from_rows(sample_rows)
+    assert [item.symbol for item in ranked] == ["BBB", "AAA"]
+    assert ranked[0].volume == 30
+    assert ranked[0].currency == "usdt"
+    assert ranked[0].pair == "BBB-USDT-SWAP"
+    assert ranked[1].change_24h == 100
     sample = parse_rss(_SAMPLE_RSS, "Fallback")
     assert len(sample) == 1
     assert sample[0].title == "比特币下跌"
@@ -617,8 +671,19 @@ def run_check() -> int:
     priced = [item for item in snapshot.quotes if item.price is not None]
     print(f"source={snapshot.price_source or '-'} live={snapshot.live} prices={len(priced)} news={len(snapshot.headlines)}")
     print(f"fear={snapshot.fear_greed} {snapshot.fear_text} cap={snapshot.market_cap} status={snapshot.status}")
-    for item in priced[:6]:
-        print(f"{item.symbol} {format_price(item.price, item.currency)} {format_change(item.change_24h)} spark={len(item.sparkline)}")
+    volumes = [item.volume or -1 for item in snapshot.quotes]
+    if priced and volumes != sorted(volumes, reverse=True):
+        print("volume rank is out of order")
+        return 1
+    if len(priced) != MARKET_COUNT:
+        print(f"expected {MARKET_COUNT} contracts")
+        return 1
+    for item in priced:
+        print(
+            f"{item.symbol} {format_price(item.price, item.currency)} "
+            f"{format_change(item.change_24h)} vol={format_compact(item.volume, item.currency)} "
+            f"spark={len(item.sparkline)}"
+        )
     for item in snapshot.headlines[:5]:
         print(f"- [{item.source}] {item.title}")
     if not priced or not snapshot.headlines:

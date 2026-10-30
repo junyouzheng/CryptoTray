@@ -10,7 +10,7 @@ from typing import Callable
 import customtkinter as ctk
 
 from crypto_tray import __version__
-from crypto_tray.coins import CATALOG
+from crypto_tray.coins import BY_SYMBOL, CATALOG
 from crypto_tray.fetch import Headline, Quote, Snapshot
 from crypto_tray.formatters import format_change, format_compact, format_price, relative_time
 from crypto_tray.icons import draw_icon
@@ -57,7 +57,7 @@ def tone(value: float | None) -> str:
 
 
 def badge_colors(coin_id: str, symbol: str) -> tuple[str, str]:
-    known = CATALOG.get(coin_id)
+    known = CATALOG.get(coin_id) or BY_SYMBOL.get(symbol)
     if known is not None:
         return known.badge
     return _BADGES[sum(ord(char) for char in symbol) % len(_BADGES)]
@@ -130,7 +130,7 @@ class CoinRow(ctk.CTkFrame):
         self.update_quote(quote)
 
     def update_quote(self, quote: Quote) -> None:
-        price_text = format_price(quote.price, "usd")
+        price_text = format_price(quote.price, quote.currency)
         if price_text != self._price_text:
             self._price_text = price_text
             self.price.configure(text=price_text)
@@ -138,7 +138,7 @@ class CoinRow(ctk.CTkFrame):
         if quote.change_1h is not None:
             parts.append(f"1小时 {quote.change_1h:+.2f}%")
         if quote.volume is not None:
-            parts.append(f"24h成交 {format_compact(quote.volume, 'usd')}")
+            parts.append(f"24h成交额 {format_compact(quote.volume, quote.currency)}")
         sub_text = "  ·  ".join(parts) if parts else " "
         if sub_text != self._sub_text:
             self._sub_text = sub_text
@@ -307,7 +307,7 @@ class Dashboard:
 
         self.search = ctk.CTkEntry(
             self.market_page,
-            placeholder_text="搜索币种，例如 SOL、PEPE",
+            placeholder_text="搜索合约，例如 BTC、SOL",
             height=34,
             fg_color=SURFACE,
             border_color=LINE,
@@ -401,7 +401,7 @@ class Dashboard:
         self.set_quotes(snapshot.quotes)
         self.set_news(snapshot.headlines, snapshot.updated_at)
         if snapshot.live:
-            self.set_status("行情实时更新", UP)
+            self.set_status("合约行情实时更新", UP)
         elif snapshot.status:
             self.set_status(snapshot.status, AMBER)
 
@@ -414,7 +414,7 @@ class Dashboard:
                 text_color=tone(snapshot.fear_greed),
             )
         draw_meter(self.meter, snapshot.fear_greed)
-        self.cap_label.configure(text=f"总市值 {format_compact(snapshot.market_cap, 'usd')}")
+        self.cap_label.configure(text=f"总市值 {format_compact(snapshot.market_cap, snapshot.currency or 'usdt')}")
         if snapshot.market_change_24h is None:
             self.cap_change.configure(text="")
         else:
@@ -424,7 +424,7 @@ class Dashboard:
                 text_color=UP if rising else DOWN,
             )
 
-    def set_quotes(self, quotes: list[Quote], empty_text: str = "没有匹配的币种") -> None:
+    def set_quotes(self, quotes: list[Quote], empty_text: str = "没有匹配的币种", scroll: bool = True) -> None:
         ids = [item.coin_id for item in quotes]
         if ids == self.row_ids and self.rows:
             self.update_prices(quotes)
@@ -441,7 +441,8 @@ class Dashboard:
             self.rows[quote.coin_id] = row
         self._fit_rows()
         self.root.after(200, self._fit_rows)
-        self._scroll_top(self.market)
+        if scroll:
+            self._scroll_top(self.market)
 
     def _fit_rows(self) -> None:
         width = self.market._parent_canvas.winfo_width()
