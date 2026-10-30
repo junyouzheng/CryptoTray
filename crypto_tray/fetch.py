@@ -26,7 +26,7 @@ UA = (
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 CryptoTray/1.0"
 )
 CACHE_VERSION = 2
-MARKET_COUNT = 10
+MARKET_COUNT = 6
 
 FNG_ZH = {
     "Extreme Fear": "极度恐惧",
@@ -286,7 +286,7 @@ def _with_sparklines(quotes: list[Quote]) -> list[Quote]:
 
 
 def load_quotes(_config: Config) -> tuple[list[Quote], str, str, bool, str]:
-    """按 OKX USDT 永续合约 24 小时成交额取前 10。价格是合约最新价。"""
+    """按 OKX USDT 永续合约 24 小时成交额取前 6。价格是合约最新价。"""
     try:
         quotes = _with_sparklines(board_from_rows(fetch_swap_rows()))
     except FetchError as exc:
@@ -417,7 +417,7 @@ def _swap_index() -> dict[str, tuple[dict, float]]:
 
 
 def refresh_board(existing: list[Quote]) -> tuple[list[Quote], bool]:
-    """重新取成交额前 10，并沿用已有走势。"""
+    """重新取成交额前 6，并沿用已有走势。"""
     try:
         sparks = {item.pair: item.sparkline for item in existing}
         quotes = board_from_rows(fetch_swap_rows(), sparks)
@@ -641,12 +641,12 @@ def run_check() -> int:
     from crypto_tray.formatters import format_change, format_compact, format_price, relative_time
 
     assert format_price(1000, "usd") == "$1,000.00"
-    assert format_price(1000, "usdt") == "1,000.00 USDT"
+    assert format_price(1000, "usdt") == "1,000.00"
     assert format_price(None, "cny") == "--"
     assert format_change(1.2) == "+1.20%"
     assert format_change(-4.489) == "-4.49%"
     assert format_compact(1.32e13, "cny") == "¥13.20万亿"
-    assert format_compact(1.33e10, "usdt") == "133亿 USDT"
+    assert format_compact(1.33e10, "usdt") == "133亿"
     sample_rows = [
         {"instId": "AAA-USDT-SWAP", "last": "2", "volCcy24h": "10", "open24h": "1"},
         {"instId": "BBB-USDT-SWAP", "last": "3", "volCcy24h": "10", "open24h": "3"},

@@ -9,7 +9,7 @@ def _unit(currency: str) -> tuple[str, str]:
     if currency == "cny":
         return "¥", ""
     if currency == "usdt":
-        return "", " USDT"
+        return "", ""
     return "$", ""
 
 

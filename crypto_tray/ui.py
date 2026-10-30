@@ -116,9 +116,9 @@ class CoinRow(ctk.CTkFrame):
         self.price = ctk.CTkLabel(self, text="--", text_color=TEXT, font=fonts["price"], anchor="w")
         self.price.grid(row=1, column=1, sticky="w", padx=(0, 96), pady=(2, 0))
         self.sub = ctk.CTkLabel(
-            self, text="", text_color=MUTED, font=fonts["meta"], anchor="w", justify="left", width=148, wraplength=140
+            self, text="", text_color=MUTED, font=fonts["meta"], anchor="w", justify="left", wraplength=240
         )
-        self.sub.grid(row=2, column=1, sticky="ew", padx=(0, 8), pady=(2, 10))
+        self.sub.grid(row=2, column=1, sticky="ew", padx=(0, 92), pady=(2, 10))
         self.pill = ctk.CTkLabel(self, text="--", width=84, height=24, corner_radius=8, font=fonts["pill"], text_color=MUTED, fg_color=SURFACE_2)
         self.pill.place(relx=1.0, x=-8, y=10, anchor="ne")
         self.spark = tk.Canvas(self, width=76, height=22, bg=SURFACE, highlightthickness=0, bd=0)
@@ -450,9 +450,14 @@ class Dashboard:
             return
         self._row_width = width
         inner = width - 8
+        # 右侧留给涨跌幅和走势，成交额留在左边一行里。
+        sub_wrap = max(140, inner - 160)
         for row in self.rows.values():
+            row.sub.configure(wraplength=sub_wrap)
+            row.update_idletasks()
+            height = max(108, row.winfo_reqheight())
             row.grid_propagate(False)
-            tk.Frame.configure(row, width=inner, height=100)
+            tk.Frame.configure(row, width=inner, height=height)
 
     def update_prices(self, quotes: list[Quote]) -> None:
         if [item.coin_id for item in quotes] != self.row_ids:
@@ -497,9 +502,7 @@ class Dashboard:
             return
         scale = self.root._get_window_scaling() or 1
         wrap = max(180, int(event.width / scale) - 64)
-        sub_wrap = max(110, min(148, int(event.width / scale) - 252))
-        for row in self.rows.values():
-            row.sub.configure(wraplength=sub_wrap, width=sub_wrap + 8)
+        self._row_width = None
         self._fit_rows()
         if wrap == self.wrap:
             return
